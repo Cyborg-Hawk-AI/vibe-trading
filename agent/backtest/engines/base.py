@@ -273,6 +273,59 @@ def _maybe_enrich_events(
 # ─── Base Engine ───
 
 
+class _BarStore:
+    """Per-symbol bar matrix with O(1) timestamp->row lookup.
+
+    The execution loop used to pay for ``df.loc[ts]`` (a full pandas row
+    extraction) once per symbol per bar — hundreds of thousands of times per
+    evaluation. ``_BarStore`` pre-extracts column numpy arrays and a
+    timestamp->position map once; rows become zero-copy views.
+    """
+
+    __slots__ = ("pos", "cols", "cmap", "arrays")
+
+    def __init__(self, df: pd.DataFrame):
+        self.pos = {t: k for k, t in enumerate(df.index)}
+        self.cols = tuple(df.columns)
+        self.cmap = {c: k for k, c in enumerate(self.cols)}
+        self.arrays = tuple(df[c].to_numpy() for c in self.cols)
+
+    def row(self, ts) -> "_RowView | None":
+        k = self.pos.get(ts)
+        if k is None:
+            return None
+        return _RowView(self, k, ts)
+
+
+class _RowView:
+    """Zero-copy dict-like bar row implementing the pandas Series subset the
+    engines use: ``.get``, ``[]``, ``in .index``, and ``.name`` (timestamp).
+    """
+
+    __slots__ = ("_store", "_k", "name")
+
+    def __init__(self, store: _BarStore, k: int, name):
+        self._store = store
+        self._k = k
+        self.name = name
+
+    @property
+    def index(self):
+        return self._store.cols
+
+    def get(self, key, default=None):
+        j = self._store.cmap.get(key)
+        if j is None:
+            return default
+        return self._store.arrays[j][self._k]
+
+    def __getitem__(self, key):
+        return self._store.arrays[self._store.cmap[key]][self._k]
+
+    def __contains__(self, key):
+        return key in self._store.cmap
+
+
 class BaseEngine(ABC):
     """Abstract base for all market engines.
 
@@ -294,6 +347,8 @@ class BaseEngine(ABC):
         self.equity_snapshots: List[EquitySnapshot] = []
         self._bar_idx: int = 0
         self._active_symbol: str = ""  # set by _rebalance/_close_position for subclass use
+        # Fast bar/price access during _execute_bars (None outside the loop).
+        self._fast_bars: Optional[dict] = None
 
     # ── Market rule interface (subclass must implement) ──
 
@@ -552,6 +607,38 @@ class BaseEngine(ABC):
         codes: List[str],
     ) -> None:
         """Bar-by-bar execution with market rule enforcement."""
+        # Pre-extract aligned numpy views once: ``_align`` guarantees both
+        # close_df and target_pos are indexed by exactly ``dates``, so row i
+        # is bar i. This replaces per-bar pandas .at/.loc scalar lookups
+        # (~85% of evaluation runtime) with O(1) array/dict access.
+        stores = {c: _BarStore(df) for c, df in data_map.items()}
+        if not target_pos.index.equals(dates):
+            target_pos = target_pos.reindex(dates)
+        if not close_df.index.equals(dates):
+            close_df = close_df.reindex(dates)
+        tp_mat = {c: target_pos[c].to_numpy() for c in target_pos.columns}
+        close_mat = {c: close_df[c].to_numpy() for c in close_df.columns}
+        prev_fast = self._fast_bars
+        self._fast_bars = {
+            "stores": stores, "tp": tp_mat, "close": close_mat, "dates": dates,
+        }
+        try:
+            self._execute_bars_fast(dates, data_map, close_df, target_pos, codes)
+        finally:
+            self._fast_bars = prev_fast
+
+    def _execute_bars_fast(
+        self,
+        dates: pd.DatetimeIndex,
+        data_map: Dict[str, pd.DataFrame],
+        close_df: pd.DataFrame,
+        target_pos: pd.DataFrame,
+        codes: List[str],
+    ) -> None:
+        """Inner execution loop; requires ``self._fast_bars`` to be set."""
+        fast = self._fast_bars or {}
+        stores: Dict[str, _BarStore] = fast.get("stores", {})
+        tp_mat: Dict[str, Any] = fast.get("tp", {})
         for i, ts in enumerate(dates):
             self._bar_idx = i
 
@@ -561,13 +648,12 @@ class BaseEngine(ABC):
             equity = self._calc_open_equity(data_map, close_df, ts)
             target_weights: Dict[str, Optional[float]] = {}
             for c in codes:
-                try:
-                    target_weights[c] = (
-                        float(target_pos.at[ts, c]) if ts in target_pos.index else 0.0
-                    )
-                except Exception as exc:
+                arr = tp_mat.get(c)
+                if arr is None:
                     target_weights[c] = None
-                    logger.warning("Target weight failed for %s at %s: %s", c, ts, exc)
+                    continue
+                v = arr[i]
+                target_weights[c] = 0.0 if v != v else float(v)
 
             # b. Release capital before opening replacement positions.  A
             # single mixed close/open pass makes rotations depend on symbol
@@ -643,8 +729,10 @@ class BaseEngine(ABC):
             # running them first could liquidate a position that was scheduled
             # to exit at the open (or charge a position before it was opened).
             for c in codes:
-                if ts in data_map[c].index:
-                    self.on_bar(c, data_map[c].loc[ts], ts)
+                store = stores.get(c)
+                row = store.row(ts) if store is not None else None
+                if row is not None:
+                    self.on_bar(c, row, ts)
 
             # e. Record equity snapshot
             snap_equity = self._calc_equity(close_df, ts)
@@ -654,13 +742,13 @@ class BaseEngine(ABC):
                 _dirs = np.array([p.direction for p in self.positions.values()])
                 _sizes = np.array([p.size for p in self.positions.values()])
                 _cps = np.array(
-                    [self._safe_price(close_df, ts, s, ep) for s, ep in zip(_syms, _eps)]
+                    [self._price_at(close_df, ts, s, ep) for s, ep in zip(_syms, _eps)]
                 )
                 total_unrealized = float(np.sum(_dirs * _sizes * (_cps - _eps)))
             else:
                 total_unrealized = 0.0
                 for p in self.positions.values():
-                    cp = self._safe_price(close_df, ts, p.symbol, p.entry_price)
+                    cp = self._price_at(close_df, ts, p.symbol, p.entry_price)
                     total_unrealized += self._calc_pnl(p.symbol, p.direction, p.size, p.entry_price, cp)
             self.equity_snapshots.append(EquitySnapshot(
                 timestamp=ts,
@@ -675,7 +763,7 @@ class BaseEngine(ABC):
             last_ts = dates[-1]
             for c in list(self.positions.keys()):
                 pos = self.positions[c]
-                mark_price = self._safe_price(close_df, last_ts, c, pos.entry_price)
+                mark_price = self._price_at(close_df, last_ts, c, pos.entry_price)
                 self._active_symbol = c
                 exit_price = self.apply_slippage(mark_price, -pos.direction)
                 self._close_position(c, exit_price, last_ts, "end_of_backtest")
@@ -691,6 +779,34 @@ class BaseEngine(ABC):
                     equity=self.capital,
                     positions=0,
                 )
+
+    def _price_at(self, close_df: pd.DataFrame, ts: pd.Timestamp, symbol: str, fallback: float) -> float:
+        """Fast path for _safe_price using the aligned close matrix when the
+        execution loop is active; identical semantics otherwise."""
+        fast = self._fast_bars
+        if fast is not None:
+            arr = fast["close"].get(symbol)
+            if arr is not None:
+                i = self._bar_idx
+                dates = fast["dates"]
+                if 0 <= i < len(dates) and dates[i] == ts:
+                    v = arr[i]
+                    return float(v) if v == v else fallback
+                return self._safe_price(close_df, ts, symbol, fallback)
+            return fallback
+        return self._safe_price(close_df, ts, symbol, fallback)
+
+    def _bar_at(self, symbol: str, df: Optional[pd.DataFrame], ts: pd.Timestamp):
+        """Row at ``ts`` via the precomputed bar store when available."""
+        fast = self._fast_bars
+        if fast is not None:
+            store = fast["stores"].get(symbol)
+            if store is None:
+                return None
+            return store.row(ts)
+        if df is None or ts not in df.index:
+            return None
+        return df.loc[ts]
 
     def _calc_open_equity(
         self,
@@ -710,10 +826,10 @@ class BaseEngine(ABC):
 
         equity = self.capital
         for sym, pos in self.positions.items():
-            current_price = self._safe_price(close_df, ts, sym, pos.entry_price)
-            frame = data_map.get(sym)
-            if frame is not None and ts in frame.index:
-                open_price = frame.loc[ts].get("open")
+            current_price = self._price_at(close_df, ts, sym, pos.entry_price)
+            bar = self._bar_at(sym, data_map.get(sym), ts)
+            if bar is not None:
+                open_price = bar.get("open")
                 if (
                     open_price is not None
                     and pd.notna(open_price)
@@ -748,7 +864,7 @@ class BaseEngine(ABC):
             leverages = np.array([p.leverage for p in self.positions.values()])
 
             current_prices = np.array(
-                [self._safe_price(close_df, ts, s, ep) for s, ep in zip(syms, entry_prices)]
+                [self._price_at(close_df, ts, s, ep) for s, ep in zip(syms, entry_prices)]
             )
 
             margins = sizes * entry_prices / leverages
@@ -757,7 +873,7 @@ class BaseEngine(ABC):
 
         equity = self.capital
         for sym, pos in self.positions.items():
-            cp = self._safe_price(close_df, ts, sym, pos.entry_price)
+            cp = self._price_at(close_df, ts, sym, pos.entry_price)
             margin = self._calc_margin(sym, pos.size, pos.entry_price, pos.leverage)
             unrealized = self._calc_pnl(sym, pos.direction, pos.size, pos.entry_price, cp)
             equity += margin + unrealized
@@ -779,10 +895,9 @@ class BaseEngine(ABC):
         # Nothing to do
         if current_pos is None and target_dir == 0:
             return
-        if df is None or ts not in df.index:
+        bar = self._bar_at(symbol, df, ts)
+        if bar is None:
             return
-
-        bar = df.loc[ts]
 
         # Close if target is flat or direction changed
         if current_pos is not None:
@@ -811,9 +926,11 @@ class BaseEngine(ABC):
         """Price an opening order without mutating portfolio state."""
         self._active_symbol = symbol
         direction = 1 if target_weight > 1e-9 else (-1 if target_weight < -1e-9 else 0)
-        if direction == 0 or symbol in self.positions or df is None or ts not in df.index:
+        if direction == 0 or symbol in self.positions:
             return None
-        bar = df.loc[ts]
+        bar = self._bar_at(symbol, df, ts)
+        if bar is None:
+            return None
         if not self.can_execute(symbol, direction, bar):
             return None
         open_price = float(bar.get("open", bar.get("close", 0)))

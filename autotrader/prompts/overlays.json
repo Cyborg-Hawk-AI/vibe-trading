@@ -1,0 +1,10 @@
+{
+  "_comment": "Failure-mode -> committee prompt guidance. compile_overlay() joins the entries for the dominant failure modes of the current generation and injects them into every TradingAgents agent prompt via the get_language_instruction monkeypatch.",
+  "premature_stop": "Recent simulations show losses from stops placed too close to entry: positions were stopped out and then recovered. When you judge an entry, explicitly consider whether normal volatility (ATR) would survive the proposed stop distance, and flag setups that need wider stops or smaller size.",
+  "fakeout_entry": "Recent simulations show losses from entering on volume/price spike bars that immediately faded. Treat single-bar breakouts and volume spikes with suspicion; require confirmation (follow-through bar, higher-timeframe alignment) before endorsing momentum entries.",
+  "whipsaw_churn": "Recent simulations show churn: repeated short losing trades in choppy, range-bound conditions. Explicitly assess whether the market is trending or ranging, and recommend standing aside when the regime does not fit the strategy.",
+  "overbought_entry": "Recent simulations show losses from buying when RSI was already overbought. Weigh momentum exhaustion carefully and avoid endorsing entries late in extended moves.",
+  "illiquid": "Recent simulations show losses in thin, illiquid names where fills were poor. Down-weight recommendations on symbols with weak dollar volume and flag liquidity risk in your report.",
+  "late_exit": "Recent simulations show winners given back into losses because exits were too slow. Emphasize profit-protection: trailing logic, partial exits, and clear invalidation levels.",
+  "oversized_loss": "Recent simulations show single trades losing more than the per-trade risk budget. Emphasize position sizing discipline: no single position should risk more than a small fraction of account equity."
+}

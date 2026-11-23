@@ -90,3 +90,14 @@ AGENTS.md
 # Alpha Zoo wiki artifacts (generated, not source)
 wiki/alpha-library/manifest.json
 wiki/alpha-library/content/
+
+# Autotrader pipeline local state (registry, data snapshots, run artifacts)
+autotrader/state/
+runs/autotrader/
+*.env
+
+# macOS AppleDouble junk from external drives (._ sidecar files)
+._*
+**/_._*
+**/.DS_Store
+.specstory/
