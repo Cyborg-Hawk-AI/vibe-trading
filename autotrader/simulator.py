@@ -108,6 +108,7 @@ class SimulationResult:
     total_return: float = 0.0
     max_drawdown: float = 0.0
     sharpe: float = 0.0
+    train_sharpe: float = 0.0
     trade_count: int = 0
     win_rate: float = 0.0
     # Window stats
@@ -136,7 +137,7 @@ class SimulationResult:
         return (
             self.train_pass_rate,
             self.train_mean_window_ret,
-            self.sharpe if math.isfinite(self.sharpe) else -1.0,
+            self.train_sharpe if math.isfinite(self.train_sharpe) else -1.0,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -192,6 +193,11 @@ def slice_windows(
     oos_from = math.floor(len(starts) * (1.0 - oos_fraction))
     for k, s in enumerate(starts):
         e = s + window_bars
+
+        if k < oos_from < len(starts):
+          if e >= starts[oos_from]: 
+            continue
+        
         w = eq.iloc[s : e + 1]
         base = float(w.iloc[0])
         if base <= 0:
@@ -529,7 +535,24 @@ def simulate_genome(
             and result.stretch_25_pass_rate >= gate.stretch_min_pass_rate
             and result.max_drawdown <= gate.max_drawdown
         )
+    
+  train_windows = [w for w in result.windows if not w.is_oos]
+  result.train_sharpe = -1.0
 
+  if train_windows: 
+      train_end = pd.Timestamp(train_windows[-1].end).date()
+      train_equity = equity.dropna()
+      train_equity = train_equity[
+        train_equity.index.date < train_end
+    ]
+      returns = train_equity.pct_change().dropna()
+
+      if len(returns) > 1 and returns.std() > 0: 
+        result.train_sharpe = float(
+          returns.mean() / returns.std()
+          * np.sqrt(bars_per_year)
+        )
+      
     if scan_anomalies:
         result.anomalies = detect_anomalies(data_map)
 
