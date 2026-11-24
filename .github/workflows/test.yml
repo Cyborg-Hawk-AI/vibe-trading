@@ -37,7 +37,10 @@ jobs:
           python -m py_compile src/agent/loop.py
           python -m py_compile src/tools/__init__.py
           python -m py_compile backtest/runner.py
-
+          
+      - name: Run autotrader tests
+        run: python -m pytest autotrader/tests -v --tb=short
+        
       - name: Run tests
         # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
         # (real-LLM only); list --ignore here so CI's intent is explicit and
