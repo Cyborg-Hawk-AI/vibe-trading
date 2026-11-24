@@ -20,7 +20,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: 
+          pip install -e ".[dev]"
+          pip install pyarrow
 
       - name: Repository safety gates
         run: bash tools/ci_grep_gates.sh
