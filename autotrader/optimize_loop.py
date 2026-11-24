@@ -166,7 +166,6 @@ def llm_propose_genomes(
         name: {"low": lo, "high": hi, "type": {"f": "float", "i": "int", "b": "0/1"}[k]}
         for name, (lo, hi, k) in GENE_SPACE.items()
     }
-    from autotrader.knowledge import prompt_suffix
 
     reply = chat(
         cfg.llm,
@@ -178,13 +177,12 @@ def llm_propose_genomes(
             "holding horizons) while counteracting the dominant failures. "
             f"Reply with ONLY a JSON array of {n} objects, each containing "
             "every parameter name with a value inside its bounds."
-            + prompt_suffix()
         ),
         user=json.dumps(
             {
                 "space": space_desc,
-                "top_genomes": [row["genome"] for row in leaderboard[:3]],
-                "failure_counts": failure_counts,
+                "top_genomes": [],
+                "failure_counts": {},
             }
         ),
         max_tokens=1800,
@@ -466,21 +464,11 @@ def evolve_sleeve(
                 (clamp_to_risk_bounds(random_genome(rng), cfg), "exploration", None)
                 for _ in range(n_explore)
             )
-            success_bias = attribution.get("gene_bias") or {}
             while len(next_pop) < ev.population_size:
                 a, b = tournament(), tournament()
                 child = crossover(a, b, rng)
-                roll = rng.random()
-                if success_bias and roll < 0.25:
-                    # Reinforce what attribution says the winners captured.
-                    child = mutate_gene_bias(child, success_bias, rng, ev.mutation_sigma)
-                    origin = "success_bias"
-                elif gen_report.failure_counts and roll < 0.75:
-                    child = mutate_biased(child, gen_report.failure_counts, rng, ev.mutation_sigma)
-                    origin = "biased_mutation"
-                else:
-                    child = mutate(child, rng, ev.mutation_sigma)
-                    origin = "mutation"
+                child = mutate(child, rng, ev.mutation_sigma)
+                origin = "mutation"
                 child = clamp_to_risk_bounds(child, cfg)
                 next_pop.append((child, origin, genome_id(a)))
             population = next_pop[: ev.population_size]
