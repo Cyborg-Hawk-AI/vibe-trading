@@ -21,8 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: 
-          pip install -e ".[dev]"
-          pip install pyarrow
+          pip install -e ".[dev]" pyarrow
 
       - name: Repository safety gates
         run: bash tools/ci_grep_gates.sh
