@@ -306,12 +306,36 @@ def _build_config(
     cfg: PipelineConfig,
     sleeve: str,
     interval: str | None = None,
+    *,
+    partition: str,
 ) -> dict[str, Any]:
+    cfg.data.validate_dates()
+
+    partitions = {
+        "train": (
+            cfg.data.start_date,
+            cfg.data.train_end_date,
+        ),
+        "validation": (
+            cfg.data.train_end_date,
+            cfg.data.validation_end_date,
+        ),
+        "holdout": (
+            cfg.data.validation_end_date,
+            cfg.data.end_date,
+        ),
+    }
+
+    if partition not in partitions:
+        raise ValueError(f"Unknown research partition: {partition!r}")
+
+    start_date, end_date = partitions[partition]
+
     is_equity = sleeve in ("equities", "equities_penny")
     base: dict[str, Any] = {
         "codes": codes,
-        "start_date": cfg.data.start_date,
-        "end_date": cfg.data.end_date,
+        "start_date": start_date,
+        "end_date": end_date,
         "interval": interval or cfg.data.interval,
         "source": cfg.data.source,
         "initial_cash": (
@@ -362,6 +386,7 @@ def simulate_genome(
     cfg: PipelineConfig,
     sleeve: str,
     *,
+    partition: str,
     interval: str = "1D",
     keep_run_dir: bool = False,
     scan_anomalies: bool = False,
@@ -379,12 +404,50 @@ def simulate_genome(
 
     gid = genome_id(genome)
     result = SimulationResult(genome=genome, gid=gid, sleeve=sleeve, ok=False)
+    
+    # Restrict market data to the requested research partition.
+    partition_config = _build_config(
+        [],
+        cfg,
+        sleeve,
+        interval=interval,
+        partition=partition,
+    )
+
+    start_date = pd.Timestamp(partition_config["start_date"])
+    end_date = pd.Timestamp(partition_config["end_date"])
+
+    filtered_data = {}
+
+    for code, df in data_map.items():
+        index = pd.DatetimeIndex(df.index)
+
+        if index.tz is not None:
+            start = start_date.tz_localize(index.tz)
+            end = end_date.tz_localize(index.tz)
+        else:
+            start = start_date
+            end = end_date
+
+        mask = (index >= start) & (index < end)
+        subset = df.loc[mask].copy()
+
+        if not subset.empty:
+            filtered_data[code] = subset
+
+    data_map = filtered_data
     codes = sorted(data_map)
     if not codes:
         result.error = "empty data_map"
         return result
 
-    config = _build_config(codes, cfg, sleeve, interval=interval)
+    config = _build_config(
+        codes,
+        cfg,
+        sleeve,
+        interval=interval,
+        partition=partition,
+    )
     run_dir = runs_dir() / f"{sleeve}_{gid}_{uuid.uuid4().hex[:6]}"
     (run_dir / "code").mkdir(parents=True, exist_ok=True)
     # Execution-context params for the active interval (not genome DNA):
@@ -459,7 +522,7 @@ def simulate_genome(
             equity,
             skip_bars=warmup_bars(genome),
             session_max_drawdown=dt_gate.session_max_drawdown,
-            oos_fraction=dt_gate.oos_fraction,
+            oos_fraction=0.0 if partition == "train" else 1.0,
         )
         train = [w for w in result.windows if not w.is_oos]
         oos = [w for w in result.windows if w.is_oos]
@@ -495,7 +558,7 @@ def simulate_genome(
             skip_bars=warmup_bars(genome),
             target_return=gate.target_window_return,
             max_drawdown=gate.max_drawdown,
-            oos_fraction=gate.oos_fraction,
+            oos_fraction=0.0 if partition == "train" else 1.0,
         )
         train = [w for w in result.windows if not w.is_oos]
         oos = [w for w in result.windows if w.is_oos]
@@ -511,7 +574,8 @@ def simulate_genome(
         # Operational gate: >= target return in >= min pass rate of HELD-OUT
         # windows, plus the account-level drawdown cap over the whole run.
         result.gate_passed = bool(
-            oos
+            partition == "validation"
+            and oos
             and result.oos_pass_rate >= gate.min_window_pass_rate
             and result.max_drawdown <= gate.max_drawdown
         )
@@ -524,7 +588,7 @@ def simulate_genome(
             skip_bars=warmup_bars(genome),
             target_return=gate.stretch_target_return,
             max_drawdown=gate.max_drawdown,
-            oos_fraction=gate.oos_fraction,
+            oos_fraction=0.0 if partition == "train" else 1.0,
         )
         stretch_oos = [w for w in stretch_windows if w.is_oos]
         result.stretch_25_pass_rate = (
@@ -536,22 +600,17 @@ def simulate_genome(
             and result.max_drawdown <= gate.max_drawdown
         )
     
-    train_windows = [w for w in result.windows if not w.is_oos]
-    result.train_sharpe = -1.0
-  
-    if train_windows: 
-        train_end = pd.Timestamp(train_windows[-1].end).date()
-        train_equity = equity.dropna()
-        train_equity = train_equity[
-          train_equity.index.date < train_end
-      ]
-        returns = train_equity.pct_change().dropna()
-  
-        if len(returns) > 1 and returns.std() > 0: 
-          result.train_sharpe = float(
-            returns.mean() / returns.std()
-            * np.sqrt(bars_per_year)
-          )
+        result.train_sharpe = float("nan")
+
+        if partition == "train" and train:
+            train_equity = equity.dropna().iloc[warmup_bars(genome):]
+            returns = train_equity.pct_change().dropna()
+
+            if len(returns) > 1 and returns.std() > 0:
+                result.train_sharpe = float(
+                    returns.mean() / returns.std()
+                    * np.sqrt(bars_per_year)
+                )
       
     if scan_anomalies:
         result.anomalies = detect_anomalies(data_map)
@@ -572,6 +631,8 @@ def rerun_with_validation(
     data_map: Dict[str, pd.DataFrame],
     cfg: PipelineConfig,
     sleeve: str,
+    *,
+    interval: str,
 ) -> dict[str, Any]:
     """Full artifact + validation run for a finalist (walk-forward, Monte
     Carlo, bootstrap through vibe-trading's validation module)."""
@@ -582,35 +643,60 @@ def rerun_with_validation(
     if run_dir.exists():
         shutil.rmtree(run_dir)
     (run_dir / "code").mkdir(parents=True, exist_ok=True)
-    config = _build_config(sorted(data_map), cfg, sleeve)
+    config = _build_config(
+      sorted(data_map),
+        cfg,
+        sleeve,
+        interval=interval,
+        partition="validation",
+    )
     config["validation"] = {
         "monte_carlo": {"n_simulations": 1000, "seed": 42},
         "bootstrap": {"n_bootstrap": 1000, "confidence": 0.95},
         "walk_forward": {"n_windows": 5},
     }
-    # The runner re-fetches through the registry; with the loader cache warm
-    # this stays offline for settled ranges. Fall back to snapshot-backed
-    # in-process execution if the environment blocks network entirely.
+    # Advanced validation must complete successfully.
+    # Never substitute a standard simulation for failed validation.
+    from autotrader.strategy_space import bars_per_year_for
+
+    is_intraday = interval in INTRADAY_INTERVALS
+
+    extra_params: dict[str, Any] = {
+        "bars_per_year": bars_per_year_for(interval, sleeve)
+    }
+
+    if is_intraday and sleeve != "crypto":
+        extra_params["session_eod_flat"] = 1
+
     (run_dir / "code" / "signal_engine.py").write_text(
-        render_signal_engine(genome), encoding="utf-8"
+        render_signal_engine(genome, extra_params),
+        encoding="utf-8",
     )
+  
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     stdout_sink = io.StringIO()
     try:
         with contextlib.redirect_stdout(stdout_sink):
             runner_main(run_dir)
-    except SystemExit:
-        logger.warning(
-            "runner_main failed for finalist %s (%s); falling back to in-process run",
-            gid,
-            stdout_sink.getvalue().strip()[:200],
-        )
-        result = simulate_genome(
-            genome, data_map, cfg, sleeve, keep_run_dir=True, scan_anomalies=True
-        )
-        return {"run_dir": result.run_dir, "metrics": result.to_dict()}
+    except SystemExit as exc:
+        raise RuntimeError(
+            f"Advanced validation failed for finalist {gid}. "
+            "Strategy promotion is blocked."
+        ) from exc
 
     metrics_line = stdout_sink.getvalue().strip().splitlines()
-    metrics = json.loads(metrics_line[-1]) if metrics_line else {}
+
+    if not metrics_line:
+        raise RuntimeError(
+            f"No validation results returned for finalist {gid}."
+        )
+
+    metrics = json.loads(metrics_line[-1])
+
+    if not isinstance(metrics, dict) or not metrics:
+        raise RuntimeError(
+            f"Invalid validation results for finalist {gid}."
+        )
+
     return {"run_dir": str(run_dir), "metrics": metrics}
