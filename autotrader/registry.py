@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS results (
     train_pass_rate REAL,
     oos_pass_rate REAL,
     train_mean_window_ret REAL,
+    train_sharpe REAL,
     oos_mean_window_ret REAL,
     gate_passed INTEGER,
     windows_json TEXT,
@@ -75,6 +76,19 @@ class Registry:
         self.path = Path(path) if path else state_dir() / "registry.db"
         self._conn = sqlite3.connect(str(self.path))
         self._conn.executescript(_SCHEMA)
+
+        columns = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(results)"
+            )
+        }
+
+        if "train_sharpe" not in columns:
+            self._conn.execute(
+                "ALTER TABLE results ADD COLUMN train_sharpe REAL"
+            )
+
         self._conn.commit()
 
     def close(self) -> None:
@@ -99,17 +113,44 @@ class Registry:
         self._conn.commit()
 
     # -- results ------------------------------------------------------------
-
-    def record_result(self, sim_result: Any, generation: int,
-                      diagnostics: dict[str, Any] | None = None) -> None:
+    def record_result(
+        self,
+        sim_result: Any,
+        generation: int,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
         r = sim_result
         self._conn.execute(
-            "INSERT OR REPLACE INTO results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            """
+            INSERT OR REPLACE INTO results (
+                gid, sleeve, generation, ok, error,
+                total_return, max_drawdown, sharpe,
+                trade_count, win_rate,
+                train_pass_rate, oos_pass_rate,
+                train_mean_window_ret, train_sharpe,
+                oos_mean_window_ret, gate_passed,
+                windows_json, diagnostics_json,
+                created_at
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?,
+                ?
+            )
+            """,
             (
-                r.gid, r.sleeve, generation, int(r.ok), r.error,
-                r.total_return, r.max_drawdown, r.sharpe, r.trade_count, r.win_rate,
+                r.gid, r.sleeve, generation,
+                int(r.ok), r.error,
+                r.total_return, r.max_drawdown,
+                r.sharpe, r.trade_count, r.win_rate,
                 r.train_pass_rate, r.oos_pass_rate,
-                r.train_mean_window_ret, r.oos_mean_window_ret,
+                r.train_mean_window_ret,
+                r.train_sharpe,
+                r.oos_mean_window_ret,
                 int(r.gate_passed),
                 json.dumps([vars(w) for w in r.windows]),
                 json.dumps(diagnostics or {}),
@@ -117,7 +158,7 @@ class Registry:
             ),
         )
         self._conn.commit()
-
+        
     def record_generation(
         self,
         sleeve: str,
@@ -146,6 +187,39 @@ class Registry:
 
     # -- queries ------------------------------------------------------------
 
+    def research_leaderboard(
+        self, sleeve: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        cur = self._conn.execute(
+            """
+            SELECT r.gid, r.generation,
+                   r.train_pass_rate,
+                   r.train_mean_window_ret,
+                   r.train_sharpe,
+                   s.genome_json
+            FROM results r JOIN strategies s
+              ON r.gid = s.gid AND r.sleeve = s.sleeve
+            WHERE r.sleeve = ?
+              AND r.ok = 1
+              AND r.train_sharpe IS NOT NULL
+            ORDER BY r.train_pass_rate DESC,
+                     r.train_mean_window_ret DESC,
+                     r.train_sharpe DESC,
+                     r.gid ASC
+            LIMIT ?
+            """,
+            (sleeve, limit),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [
+            dict(zip(cols, row))
+            for row in cur.fetchall()
+        ]
+        for row in rows:
+            row["genome"] = json.loads(
+                row.pop("genome_json")
+            )
+        return rows    
     def leaderboard(self, sleeve: str, limit: int = 10) -> list[dict[str, Any]]:
         cur = self._conn.execute(
             """
