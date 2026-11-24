@@ -136,36 +136,25 @@ def build_cycle_payload(
     objective: str | None = None,
 ) -> dict[str, Any]:
     """Compact, JSON-serializable account of one cycle for the LLM."""
+  
     def _slim(r: dict[str, Any]) -> dict[str, Any]:
         return {
             "gid": r.get("gid"),
-            "ok": r.get("ok"),
             "train_pass_rate": r.get("train_pass_rate"),
-            "oos_pass_rate": r.get("oos_pass_rate"),
-            "oos_mean_window_ret": r.get("oos_mean_window_ret"),
-            "total_return": r.get("total_return"),
-            "max_drawdown": r.get("max_drawdown"),
-            "sharpe": r.get("sharpe"),
-            "trade_count": r.get("trade_count"),
-            "gate_passed": r.get("gate_passed"),
-            "stretch_25_pass_rate": r.get("stretch_25_pass_rate"),
-            "stretch_25_passed": r.get("stretch_25_passed"),
+            "train_mean_window_ret": r.get("train_mean_window_ret"),
+            "train_sharpe": r.get("train_sharpe"),
         }
-
+      
     return {
         "sleeve": sleeve,
         "cycle": cycle,
         "objective": objective or "",
         "results": [_slim(r) for r in results],
-        "failure_counts": failure_counts,
+        "failure_counts": {},
         "leaderboard_top5": [
-            {k: row.get(k) for k in (
-                "gid", "oos_pass_rate", "train_pass_rate",
-                "oos_mean_window_ret", "sharpe", "gate_passed",
-            )}
-            for row in leaderboard[:5]
+            _slim(r) for r in results[:5]
         ],
-        "attribution": (attribution or [])[:5],
+        "attribution": [],
         "gene_space_hard_bounds": {
             name: [low, high] for name, (low, high, _k) in HARD_GENE_SPACE.items()
         },
