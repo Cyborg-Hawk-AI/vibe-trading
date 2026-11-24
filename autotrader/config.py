@@ -147,7 +147,13 @@ class EvolutionConfig:
 @dataclass
 class DataConfig:
     start_date: str = "2024-07-01"
-    end_date: str = "2026-07-01"         # >= 1 year of history
+    end_date: str = "2026-07-01"
+
+    # Fixed chronological research boundaries.
+    # Partition end dates are exclusive.
+    train_end_date: str = "2025-09-01"
+    validation_end_date: str = "2026-02-01"
+
     interval: str = "1D"
     # Bar intervals prefetched into snapshots; the genome's timeframe gene
     # selects among the ones actually available. 1D must always be present.
@@ -161,6 +167,23 @@ class DataConfig:
     crypto_universe_size: int = 12
     penny_universe_size: int = 20
 
+    def validate_dates(self) -> None:
+        from datetime import date
+
+        start = date.fromisoformat(self.start_date)
+        train_end = date.fromisoformat(self.train_end_date)
+        validation_end = date.fromisoformat(self.validation_end_date)
+        end = date.fromisoformat(self.end_date)
+
+        if not start < train_end < validation_end < end:
+            raise ValueError(
+                "Invalid research partition dates: "
+                "expected start_date < train_end_date < "
+                "validation_end_date < end_date."
+            )
+
+    def __post_init__(self) -> None:
+        self.validate_dates()
 
 @dataclass
 class PaperConfig:
@@ -335,4 +358,5 @@ class PipelineConfig:
         FrictionConfig(**{k: getattr(cfg.friction, k) for k in (
             "equity_slippage", "crypto_taker_fee", "crypto_slippage", "crypto_fee_bump",
         )})
+        cfg.data.validate_dates()
         return cfg

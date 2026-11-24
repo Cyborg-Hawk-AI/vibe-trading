@@ -166,7 +166,6 @@ def llm_propose_genomes(
         name: {"low": lo, "high": hi, "type": {"f": "float", "i": "int", "b": "0/1"}[k]}
         for name, (lo, hi, k) in GENE_SPACE.items()
     }
-    from autotrader.knowledge import prompt_suffix
 
     reply = chat(
         cfg.llm,
@@ -178,13 +177,12 @@ def llm_propose_genomes(
             "holding horizons) while counteracting the dominant failures. "
             f"Reply with ONLY a JSON array of {n} objects, each containing "
             "every parameter name with a value inside its bounds."
-            + prompt_suffix()
         ),
         user=json.dumps(
             {
                 "space": space_desc,
-                "top_genomes": [row["genome"] for row in leaderboard[:3]],
-                "failure_counts": failure_counts,
+                "top_genomes": [],
+                "failure_counts": {},
             }
         ),
         max_tokens=1800,
@@ -273,54 +271,14 @@ def evolve_sleeve(
         (clamp_to_risk_bounds(random_genome(rng), cfg), "seed", None)
         for _ in range(ev.population_size)
     ]
-    # Inject known operational gate-passers / champion so the search re-scores
-    # evidence-based survivors instead of only random DNA each cycle. Daytrade
-    # sweeps prefer their own intraday-born passers over legacy daily seeds.
-    injected = 0
-    try:
-        from autotrader.validation_ladder import load_gate_passer_seeds
-
-        max_inject = max(4, ev.population_size // 4)
-        seeds = []
-        if snapshot.startswith("daytrade"):
-            seeds = load_gate_passer_seeds(
-                limit=max_inject,
-                path=state_dir() / "daytrade_gate_passers_seed.json",
-            )
-        seeds += load_gate_passer_seeds(limit=max_inject)
-        seen_gids: set[str] = set()
-        injected = 0
-        for row in seeds:
-            gid = row.get("gid")
-            if gid and gid in seen_gids:
-                continue
-            if gid:
-                seen_gids.add(gid)
-            genome = row.get("genome")
-            if not genome:
-                continue
-            # Do not inject equities DNA into crypto (or vice versa).
-            row_sleeve = row.get("sleeve")
-            if row_sleeve and row_sleeve != sleeve:
-                continue
-            population[injected] = (
-                clamp_to_risk_bounds(dict(genome), cfg),
-                "gate_seed",
-                row.get("gid"),
-            )
-            injected += 1
-            if injected >= max(4, ev.population_size // 4):
-                break
-        if injected:
-            logger.info("[%s] seeded %d gate-passer genomes into population", sleeve, injected)
-    except Exception as exc:  # noqa: BLE001 — seeding must not kill evolve
-        logger.warning("[%s] gate-passer seeding skipped: %s", sleeve, exc)
+   #  Research must not seed from validation-selected strategies
+    injcted = 0
 
     # Registry-leaderboard seeding: re-inject this sleeve's best measured
     # genomes (including AWS-burst winners merged back into the registry) so
     # each cycle climbs from the evidence frontier instead of re-discovering it.
     try:
-        board = registry.leaderboard(sleeve, limit=max(4, ev.population_size // 8))
+        board = registry.research_leaderboard(sleeve, limit=max(4, ev.population_size // 8))
         reg_injected = 0
         for row in board:
             if not row.get("genome"):
@@ -337,7 +295,7 @@ def evolve_sleeve(
         if reg_injected:
             logger.info(
                 "[%s] seeded %d registry-leaderboard genomes (best oos_pass=%.2f)",
-                sleeve, reg_injected, board[0].get("oos_pass_rate") or 0.0,
+                sleeve, reg_injected, board[0].get("train_pass_rate") or 0.0,
             )
     except Exception as exc:  # noqa: BLE001 — seeding must not kill evolve
         logger.warning("[%s] registry seeding skipped: %s", sleeve, exc)
@@ -406,7 +364,7 @@ def evolve_sleeve(
                     sleeve, gen,
                     [r.to_dict() for _g, r in scored],
                     gen_report.failure_counts,
-                    registry.leaderboard(sleeve, limit=5),
+                    registry.research_leaderboard(sleeve, limit=5),
                     attribution["attributions"],
                     objective=objective_text(cfg),
                 ),
@@ -445,7 +403,7 @@ def evolve_sleeve(
 
             # ---- breed next generation ----
             elites = [g for g, _r in scored[: ev.elite_keep]]
-            leaderboard = registry.leaderboard(sleeve, limit=5)
+            leaderboard = registry.research_leaderboard(sleeve, limit=5)
             llm_children = llm_propose_genomes(
                 cfg, leaderboard, gen_report.failure_counts, ev.llm_proposals_per_gen, rng
             )
@@ -466,21 +424,11 @@ def evolve_sleeve(
                 (clamp_to_risk_bounds(random_genome(rng), cfg), "exploration", None)
                 for _ in range(n_explore)
             )
-            success_bias = attribution.get("gene_bias") or {}
             while len(next_pop) < ev.population_size:
                 a, b = tournament(), tournament()
                 child = crossover(a, b, rng)
-                roll = rng.random()
-                if success_bias and roll < 0.25:
-                    # Reinforce what attribution says the winners captured.
-                    child = mutate_gene_bias(child, success_bias, rng, ev.mutation_sigma)
-                    origin = "success_bias"
-                elif gen_report.failure_counts and roll < 0.75:
-                    child = mutate_biased(child, gen_report.failure_counts, rng, ev.mutation_sigma)
-                    origin = "biased_mutation"
-                else:
-                    child = mutate(child, rng, ev.mutation_sigma)
-                    origin = "mutation"
+                child = mutate(child, rng, ev.mutation_sigma)
+                origin = "mutation"
                 child = clamp_to_risk_bounds(child, cfg)
                 next_pop.append((child, origin, genome_id(a)))
             population = next_pop[: ev.population_size]
